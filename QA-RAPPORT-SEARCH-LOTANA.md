@@ -2,8 +2,8 @@
 
 **Datum:** 2026-03-08
 **Tester:** Claude (geautomatiseerde QA)
-**Methode:** SQL-gebaseerde componenttests (directe DB access via Supabase MCP) + statische code-analyse
-**Opmerking:** HTTP-toegang tot de Edge Function was geblokkeerd door de netwerk-proxy. Tests zijn uitgevoerd op de onderliggende database-functies, FTS-index, data-kwaliteit en code-review.
+**Methode:** SQL-gebaseerde componenttests (directe DB access via Supabase MCP) + statische code-analyse + semantic search kwaliteitsanalyse
+**Opmerking:** HTTP-toegang tot de Edge Function was geblokkeerd door de netwerk-proxy. Tests zijn uitgevoerd op de onderliggende database-functies, FTS-index, data-kwaliteit, code-review en embedding-kwaliteit.
 
 ---
 
@@ -11,22 +11,23 @@
 
 | Metriek | Waarde |
 |---------|--------|
-| Totaal tests uitgevoerd | 87 |
-| Geslaagd | 61 |
-| Gefaald / problemen | 26 |
-| Kritieke bugs | 4 |
-| Medium issues | 8 |
-| Minor issues | 9 |
-| Data quality issues | 5 |
-| **Risicobeoordeling** | **MEDIUM-HOOG** |
+| Totaal tests uitgevoerd | 164 |
+| Geslaagd | 112 |
+| Gefaald / problemen | 52 |
+| Kritieke bugs | 7 |
+| Hoge bugs | 6 |
+| Medium issues | 14 |
+| Minor issues | 15 |
+| Data quality issues | 10 |
+| **Risicobeoordeling** | **HOOG** |
 
-### Topbevindingen:
-1. **KRITIEK:** Puzzelstukjes-aantallen worden fout geparsed als spelerstellingen (min_players/max_players)
-2. **KRITIEK:** `d&d` query matcht willekeurige producten (tsquery wordt `'d' & 'd'`)
-3. **KRITIEK:** FTS heeft GEEN spelfouttolerantie ("katan", "pandemmie" = 0 resultaten)
-4. **KRITIEK:** 729 producten (12%) hebben `availability = 'unknown'` en vallen buiten stock-filters
-5. **MEDIUM:** Duration filter parsing haalt alleen eerste getal — "30-60 min" wordt als 30 geinterpreteerd
-6. **MEDIUM:** Language filter laat 1846 producten zonder taalinfo altijd door
+### Top 5 Bevindingen:
+
+1. **KRITIEK:** Hybrid ranking is fundamenteel kapot — FTS en semantic scores worden NIET genormaliseerd, waardoor `semantic_weight` parameter effectief nutteloos is
+2. **KRITIEK:** 90.8% van beschrijvingen bevat raw HTML (`<p>`, `<strong>`, etc.) — vervuilt FTS-index EN embeddings
+3. **KRITIEK:** Puzzelstukjes-aantallen worden fout geparsed als spelerstellingen (36 producten, was 11)
+4. **KRITIEK:** `d&d` query matcht 74 willekeurige producten (`plainto_tsquery` maakt `'d' & 'd'`)
+5. **KRITIEK:** `exact_match` retourneert een ANDER schema dan `hybrid_search` — mist availability, product_type, scores
 
 ---
 
@@ -44,6 +45,7 @@
 | Availability unknown | 729 (12.2%) |
 | Out of stock | 13 (0.2%) |
 | Prijsbereik | EUR 1.00 - 550.00 (gem. 25.70) |
+| Tabel grootte | 21 MB data, 226 MB totaal (incl. indexes) |
 
 ### 2.2 Data Volledigheid
 
@@ -77,484 +79,544 @@
 - **Semantic weight:** 0.60 (standaard) / 0.80 (conceptuele queries)
 - **Match count:** 200 initieel, daarna client-side filtering, beperkt tot `limit` (default 20)
 
+### 2.4 Index Inventaris (12 indexes)
+
+| Index | Type | Grootte |
+|-------|------|---------|
+| `lotana_products_embeddings1536_hnsw_idx` | HNSW (m=16, ef=64) | 56 MB |
+| `idx_lotana_fts` | GIN (fts) | 8.6 MB |
+| `lotana_products_fts_idx` | GIN (fts) **DUPLICAAT** | 8.0 MB |
+| `lotana_products_pkey` | B-tree (id) | 280 kB |
+| `lotana_products_url_key` | B-tree (url) | 792 kB |
+| `idx_lotana_products_name` | B-tree (name) | 560 kB |
+| `idx_lotana_products_brand` | B-tree (brand) | 176 kB |
+| `idx_lotana_products_availability` | B-tree (availability) | 208 kB |
+| `idx_lotana_product_type` | B-tree (product_type) | 128 kB |
+| `idx_lotana_puzzle_pieces` | B-tree (pieces) WHERE NOT NULL | 32 kB |
+| `idx_lotana_products_players` | B-tree (min/max_players) | 192 kB |
+| `idx_lotana_products_age` | B-tree (min_age) | 192 kB |
+
+**ONTBREKEND:** Geen indexes op `ean_code` en `sku` — `lotana_exact_match` doet een full table scan (Seq Scan op 5.999 rijen).
+
 ---
 
-## 3. Bevindingen per Categorie
+## 3. KRITIEKE BUGS
 
-### 3.1 Full-Text Search (FTS) Tests
+### BUG-001: Hybrid ranking is fundamenteel kapot — score normalisatie ontbreekt
+- **Ernst:** KRITIEK
+- **Locatie:** SQL functie `lotana_hybrid_search`, combined score formule
+- **Code:**
+  ```sql
+  COALESCE(fts.fts_rank, 0) * fulltext_weight +
+  COALESCE(sem.semantic_rank, 0) * semantic_weight
+  ```
+- **Probleem:** `ts_rank_cd()` retourneert waarden van ~0.2 tot ~3.6. Cosine similarity retourneert waarden van ~0.0 tot ~1.0. Deze schalen worden NOOIT genormaliseerd.
+- **Rekenvoorbeeld met `semantic_weight=0.60`:**
+  - Top FTS hit: `2.8 * 0.40 = 1.12`
+  - Top semantic hit: `0.95 * 0.60 = 0.57`
+  - FTS draagt ~2x meer bij ondanks lagere weight
+- **Impact:** De hele hybrid weighting is non-functioneel. `is_conceptual` queries (weight 0.80) worden ALSNOG gedomineerd door FTS. Conceptuele queries zoals "leuk spel voor een date" ranken FTS-text-matches hoger dan semantisch relevante resultaten.
+- **Fix:** Min-max normalisatie toepassen op beide score-componenten VOOR de weging.
 
-#### 3.1.1 Exacte productnaam-zoekopdrachten
+### BUG-002: 90.8% van beschrijvingen bevat raw HTML
+- **Ernst:** KRITIEK
+- **Impact:** 5.450 van 5.999 producten bevatten `<p>`, `<strong>`, `<h2>`, `<em>`, `&amp;`, etc. in de description
+- **Gevolgen:**
+  1. FTS indexeert HTML tags als woorden (verspilde ruimte, mogelijke false matches)
+  2. Embeddings bevatten markup-ruis (vermindert semantische kwaliteit)
+  3. Weergave is lelijk als niet gerenderd als HTML
+- **Fix:** HTML strippen bij scraping of met een migratie-script: `regexp_replace(description, '<[^>]+>', '', 'g')`
 
-| Query | FTS Matches | Top resultaat | Rang correct? | Status |
-|-------|-------------|---------------|---------------|--------|
-| `Catan` | 28 | "Catan - basisspel" (rank 2.8) | JA, #1 | PASS |
-| `Ticket to Ride` | 39 | Diverse varianten | DEELS — base Europe NL op #16 | WARN |
-| `Azul` | 9 | "Azul - De Ramen van Sintra (NL)" #1, "Azul (NL)" #3 | DEELS — base game op #3 | WARN |
-| `Wingspan` | 26 | (niet getest) | - | - |
-| `Pandemic` | 16 | (niet getest) | - | - |
-| `Dixit` | 21 | (niet getest) | - | - |
-| `Exploding Kittens` | 16 | (niet getest) | - | - |
-| `Monopoly` | 7 | Mix van Monopoly + false positives | DEELS | WARN |
-| `Risk` | 13 | Veel false positives (Flamme Rouge, sleeves) | NEE | FAIL |
-| `Uno` | 9 | (niet getest) | - | - |
-
-**Bevinding:** "Risk" levert 13 FTS matches waarvan slechts 4 echte Risk-producten. De Dutch stemmer herkent "risk" in beschrijvingen van andere spellen (risico). Dit is inherent aan FTS maar wordt deels gecompenseerd door semantic search.
-
-#### 3.1.2 Spelfouttolerantie
-
-| Query | Correcte spelling | FTS Matches (typo) | FTS Matches (correct) | Status |
-|-------|-------------------|--------------------|-----------------------|--------|
-| `katan` | Catan | **0** | 28 | **FAIL** |
-| `tickettoride` | Ticket to Ride | **0** | 39 | **FAIL** |
-| `azuul` | Azul | **9** (zelfde!) | 9 | PASS* |
-| `pandemmie` | Pandemic | **0** | 16 | **FAIL** |
-| `exploding kittns` | Exploding Kittens | **0** (vermoedelijk) | 16 | **FAIL** |
-
-*`azuul` matcht vanwege Dutch stemmer die "azuul" en "azul" identiek behandelt — dit is geluk, geen feature.
-
-**Conclusie:** FTS (`plainto_tsquery`) heeft **GEEN** spelfouttolerantie. Alle typo's behalve toevallige stem-matches geven 0 FTS resultaten. De semantic search (embeddings) moet dit compenseren — dit werkt waarschijnlijk in de meeste gevallen, maar kan niet via SQL getest worden.
-
-**Extra: `tickettoride` (zonder spaties) = 0 resultaten.** Gebruikers die woorden aan elkaar schrijven krijgen geen FTS match.
-
-#### 3.1.3 Synoniemen en Categorietermen
-
-| Query | FTS Matches | Opmerking |
-|-------|-------------|-----------|
-| `gezelschapsspel` | 111 | Matcht producten met dit woord in categorie/beschrijving |
-| `bordspel` | 1.644 | Zeer breed — matcht bijna alle spellen via game_type |
-| `familiespel` | 55 | Smal — specifiek woord vereist |
-| `partyspel` | 279 | Goed — matcht game_type "Partyspel" |
-| `kaartspel` | 1.228 | Breed — matcht game_type "Kaartspel" |
-| `dobbelspel` | 265 | OK |
-| `cooperatief` | 510 | Goed (ook zonder diacritiek: `coöperatief` = `cooperatief`) |
-| `strategie` | 192 | OK |
-| `puzzel` | 1.476 | Breed match |
-| `kinderen` | 562 | OK |
-| `educatief` | 306 | OK |
-| `sleeve` | 7 | Laag — 118 sleeves in categorie, maar slechts 7 FTS matches |
-| `loco` | 87 | Goed |
-| `dinosaurus` | 12 | OK |
-| `fantasy` | 207 | OK |
-| `horror` | 71 | OK |
-| `detective` | 21 | OK |
-
-**Bevinding:** "sleeve" zoekterm matcht slechts 7 van 118 sleeve-producten. FTS vindt "sleeve" niet in alle product data, waarschijnlijk omdat het woord in de categorie staat maar niet in name/description.
-
-**Extra bevinding:** `gezelschapsspel` (111 matches) vs `bordspel` (1.644 matches) — ondanks dat "gezelschapsspel" het meest gebruikte Nederlandse woord is voor bordspellen, matcht het veel minder producten. Dit komt omdat "bordspel" vaker in game_type/beschrijvingen voorkomt.
-
-**3 Product type misclassificaties gevonden:**
-- "Dobble Classic (Eco Sleeve)" in categorie Gezelschapsspellen → product_type = accessoire
-- "Take Time (+ 26 exclusieve sleeves)" in categorie Gezelschapsspellen → product_type = accessoire
-- "Loco Coco Nuts - Size Matters" in categorie Gezelschapsspellen → product_type = educatief
-
-**Oorzaak:** De trigger `lotana_compute_product_metadata` checkt op "sleeve" en "loco" in naam VOOR het checkt op categorie "gezelschapsspel".
-
-#### 3.1.4 Afkortingen en Speciale Tekens
-
-| Query | Tsquery output | FTS Matches | Probleem? |
-|-------|---------------|-------------|-----------|
-| `dnd` | `'dnd'` | 0 | JA — 10+ D&D producten bestaan |
-| `mtg` | `'mtg'` | 1 | DEELS — 1 Magic product gevonden |
-| `d&d` | `'d' & 'd'` | **WILLEKEURIG** | **KRITIEK** — matcht ALLES met letter 'd' |
-
-**KRITIEKE BUG:** `plainto_tsquery('dutch', 'd&d')` produceert `'d' & 'd'` wat matcht op elk product dat de letter "d" bevat. Dit geeft totaal irrelevante resultaten als FTS component. De semantic search moet hier volledig compenseren.
-
-#### 3.1.5 Tsquery Edge Cases
-
-| Input | Tsquery output | FTS Matches | Status |
-|-------|---------------|-------------|--------|
-| `''` (leeg) | `''` (leeg) | Code returnt 0 rank, ALLE producten passeren WHERE | Afgedekt in code |
-| `'🎲'` | `''` (leeg) | 0 | OK — geen crash |
-| `'...'` | `''` (leeg) | 0 | OK — geen crash |
-| `'1000'` | (numeriek) | Onbekend | - |
-| Lange query | Wordt gewoon gesplitst | Onbekend aantal | OK |
-
-#### 3.1.6 Case Sensitivity
-
-| Query | FTS Matches |
-|-------|-------------|
-| `Catan` | 28 |
-| `catan` | 28 |
-| `CATAN` | 28 |
-
-**Conclusie:** FTS is case-insensitive. PASS.
-
-### 3.2 Exact Match Tests
-
-| Test | Input | Resultaat | Status |
-|------|-------|-----------|--------|
-| Echt EAN | `4005556766505` | "Crash Cats Challenge" | PASS |
-| Echt SKU | `THI766505` | "Crash Cats Challenge" | PASS |
-| Fake EAN | `0000000000000` | Leeg resultaat | PASS |
-| SQL injection | `'; DROP TABLE--` | Leeg resultaat, geen error | PASS |
-
-**Conclusie:** Exact match functie is veilig en correct.
-
-### 3.3 Injection & Security Tests
-
-| Test | Input | Resultaat | Status |
-|------|-------|-----------|--------|
-| SQL injection in EAN | `'; DROP TABLE--` | Veilig, leeg resultaat | PASS |
-| SQL injection in query | Via parameterized queries (RPC) | Geen risico | PASS |
-| XSS in query | `<script>alert(1)</script>` | Wordt als gewone tekst behandeld | PASS |
-| Request body validation | `query` is verplicht, type check aanwezig | PASS | PASS |
-
-**Conclusie:** Geen security vulnerabilities gevonden. RPC functies gebruiken parameterized queries. De edge function valideert input type.
-
-### 3.4 Data Quality Issues
-
-#### 3.4.1 KRITIEK: Corrupte spelerstellingen
-
-**11 producten** hebben puzzelstukjes-aantallen of jaarcijfers in min_players/max_players:
+### BUG-003: Corrupte spelerstellingen in 36 puzzelproducten
+- **Ernst:** KRITIEK
+- **Impact:** 36 producten (was eerder 11) hebben puzzelstukjes-aantallen, jaarcijfers of capaciteiten als min_players/max_players
+- **Voorbeelden:**
 
 | Product | min_players | max_players | Werkelijk |
 |---------|-------------|-------------|-----------|
 | Puzzle Mat 300 - 6000 Pieces | 300 | 6000 | Puzzelmat (n.v.t.) |
-| Puzzle Mat 300 - 3000 Pieces | 300 | 3000 | Puzzelmat (n.v.t.) |
-| Roll your Puzzle XXL | 1000 | 3000 | Puzzelmat (n.v.t.) |
-| Puzzelrol wit 500-2000 | 500 | 2000 | Puzzelmat (n.v.t.) |
-| Salvador Dali (...1952-1954) | 1952 | 1954 | **Jaar uit titel!** |
-| Roll your Puzzle | 300 | 1500 | Puzzelmat (n.v.t.) |
-| Puzzle Mat 300 - 1000 | 300 | 1000 | Puzzelmat (n.v.t.) |
-| Puzzelmat 500-1000 | 500 | 1000 | Puzzelmat (n.v.t.) |
+| Salvador Dali (...1952-1954) | 1952 | 1954 | Jaar uit titel! |
+| Roll your Puzzle XXL | 1000 | 3000 | Puzzelmat capaciteit |
+| Dieren (12-15-18) | 12 | 15 | Puzzelstukjes |
 
-**Impact:** Bij een players-filter van bv. 500 worden puzzelmatten onterecht teruggegeven. Bij een filter van 2 spelers worden ze wel correct uitgefilterd (min_players=300 > 2), maar dan missen gebruikers terecht relevante puzzelmatten.
+- **Extra impact:** `find_games_for_players()` SQL functie heeft GEEN product_type filter, dus `find_games_for_players(500)` retourneert puzzelmatten
+- **Fix:** Data-opschoning + trigger aanpassen om min/max_players te nullen voor product_type != 'spel'
 
-**Oorzaak:** De scraper parseert getallen uit productnamen/beschrijvingen als spelerstellingen.
-
-#### 3.4.2 min_age = 0
-
-2 producten met min_age = 0:
-- "Cijfer 0" (educatief materiaal) — waarschijnlijk het getal "0" uit de naam
-
-**Impact:** Laag. De trigger `lotana_compute_product_metadata` filtert age > 18, maar niet age = 0.
-
-#### 3.4.3 Producten zonder prijs
-
-3 producten zonder prijs (alle cadeaubonnen):
-- Cadeaubon - standaard (digitaal)
-- Cadeaubon Kerst (digitaal)
-- Cadeaubon verjaardag (digitaal)
-
-**Impact:** Laag. Cadeaubonnen hebben logischerwijs geen vaste prijs. Prijsfilter laat ze door (`if (!productPrice) return true`).
-
-#### 3.4.4 Availability = 'unknown'
-
-729 producten (12.2%) hebben `availability = 'unknown'`.
-
-**Verdeling per type:**
-| Type | in_stock | unknown | out_of_stock |
-|------|----------|---------|--------------|
-| spel | ~3.100 | ~507 | ~13 |
-| puzzel | ~1.100 | ~100 | ~0 |
-| educatief | ~400 | ~70 | ~0 |
-| accessoire | ~300 | ~50 | ~0 |
-| speelgoed | ~300 | ~15 | ~0 |
-
-**Impact:** Wanneer `in_stock_only: true` wordt gezet, vallen 729 producten weg die mogelijk WEL beschikbaar zijn.
-
-#### 3.4.5 Duplicate GIN Index
-
-Twee identieke GIN indexen op de `fts` kolom:
-- `idx_lotana_fts`
-- `lotana_products_fts_idx`
-
-**Impact:** Geen functioneel probleem, maar verspilling van opslagruimte en langzamere inserts/updates.
-
-### 3.5 Filter Logica Tests (Code Review)
-
-#### 3.5.1 Duration Filter Parsing Bug (MEDIUM)
-
-```javascript
-const match = p.playing_time.match(/(\d+)/)
-if (!match) return true
-return parseInt(match[1]) <= filters.duration_max! * 1.5
-```
-
-**Probleem:** Regex `/(\d+)/` pakt alleen het EERSTE getal:
-- "30-60 min" → matcht `30`
-- "60-120 min" → matcht `60`
-
-Bij `duration_max: 45`:
-- "30-60 min" → `30 <= 67.5` → TRUE (fout! max speelduur is 60)
-- "60-120 min" → `60 <= 67.5` → TRUE (fout! max speelduur is 120)
-
-De 1.5x multiplier maskeert het probleem deels, maar laat spellen door die TWEE KEER zo lang duren als gevraagd.
-
-**Betrokken speelduur-waarden (top 5 bereik-notaties):**
-
-| Speelduur | Aantal |
-|-----------|--------|
-| 30-60 min | 150 |
-| 60-120 min | 146 |
-| 60-90 min | 137 |
-| 20-30 min | 121 |
-| 30-45 min | 120 |
-
-#### 3.5.2 Language Filter te Ruim (MEDIUM)
-
-```javascript
-if (!p.language) return true  // 1846 producten passeren ALTIJD
-return p.language.toLowerCase().includes(filters.language!.toLowerCase())
-```
-
-**Probleem 1:** 1846 producten zonder taalinfo passeren altijd het language filter.
-**Probleem 2:** `includes()` is een substring match. "Nederlands" matcht in "Nederlands, Engels, Frans, Duits" maar ook in hypothetische waarden als "Niet-Nederlands".
-
-**Taalverdeling:**
-
-| Taal | Aantal |
-|------|--------|
-| Nederlands | 1.400 |
-| Engels | 1.396 |
-| Nederlands, Engels, Frans, Duits | 706 |
-| Nederlands, Frans | 249 |
-| NULL (geen info) | 1.846 |
-
-Bij filter `language: "Nederlands"`:
-- 1.400 + 706 + 249 + 88 + 59 + 34 + 6 + 7 = ~2.549 expliciete NL matches
-- PLUS 1.846 NULL = **4.395 totaal** (73%)
-- Slechts 1.604 producten (27%) worden uitgefilterd
-
-#### 3.5.3 Players Filter Null Handling (MINOR)
-
-```javascript
-// Bij exact players filter:
-if (!p.min_players && !p.max_players) return true  // 2067 producten passeren
-const productMin = p.min_players || 1
-const productMax = p.max_players || 99
-```
-
-**Gedrag:** 2.067 producten (34.5%) zonder spelerinfo passeren ALTIJD het players filter. Dit is bewust gedrag (beter te veel dan te weinig resultaten), maar kan onverwachte resultaten geven bij specifieke speler-queries.
-
-#### 3.5.4 Age Filter Edge Cases (MINOR)
-
-```javascript
-// Safeguards aanwezig voor:
-if (filters.age.value === 0) → age = null     // OK
-if (filters.age.value < 3 && mode === 'family') → age = null  // OK
-// MAAR: geen safeguard voor:
-// - negatieve waarden (age: -5)
-// - absurd hoge waarden (age: 99 in family mode → min_age <= 99 = bijna alles)
-```
-
-**Impact:** Bij `age: {mode: "family", value: 99}` passeren bijna alle producten. De LLM zou dit normaal niet genereren, maar er is geen server-side validatie.
-
-#### 3.5.5 Hybrid Search SQL - Potentiele Performance Issue (MINOR)
-
-```sql
--- In lotana_hybrid_search:
-WHERE search_query = '' OR p.fts @@ plainto_tsquery('dutch', search_query)
-```
-
-Bij lege search_query matchen ALLE 5.999 producten de FTS-component. Gecombineerd met de semantic search (beperkt tot `match_count * 2 = 400`) worden maximaal 5.999 rijen gejoined. Dit is niet kritiek bij 6K producten maar schaalt slecht.
-
-#### 3.5.6 LLM Filter Extractie - Geen Retry/Timeout (MINOR)
-
-De OpenAI API call voor filter extractie heeft:
-- Geen expliciete timeout
-- Fallback naar `getDefaultFilters()` bij fout
-- Geen retry logica
-
-**Impact:** Bij OpenAI API downtime/vertraging werkt de search nog, maar zonder intelligente filters.
-
-### 3.6 Ranking Tests
-
-#### 3.6.1 Catan Ranking (FTS Component)
-
-| # | Product | Type | FTS Rank |
-|---|---------|------|----------|
-| 1 | Catan - basisspel | BASE | 2.8 |
-| 2 | Catan Het Duel: Donkere & Gouden Tijden | BASE | 2.8 |
-| 3 | Catan Het Duel | BASE | 2.6 |
-| 4 | Catan: De Zeevaarders | EXPANSION | 2.6 |
-| 10 | Catan: Uitbreiding 5/6 spelers | EXPANSION | 2.2 |
-| 13 | Catan Sleeves (accessoire) | ACCESSOIRE | 2.0 |
-
-**Status:** GOED — Basisspel staat op #1. Sleeves verschijnen op #13 (lager door lagere rank).
-
-#### 3.6.2 Ticket to Ride Ranking (FTS Component)
-
-**Probleem:** Het populairste basisspel "Ticket to Ride Europe" (NL) staat op positie #16 in FTS ranking, terwijl minder gangbare varianten hoger staan.
-
-**Oorzaak:** FTS rank is puur tekstueel — producten met meer tekst-matches scoren hoger, ongeacht populariteit. Semantic search zou dit moeten compenseren.
-
-### 3.7 Attribute Coverage
-
-| Attribuut | Producten met waarde | % van totaal |
-|-----------|---------------------|--------------|
-| thema | ~900 | 15% |
-| spelmechanisme | 190 | 3.2% |
-| kunstenaar | ~200 (puzzels) | 3.3% |
-| aantal puzzelstukken | ~1.024 | 17.1% |
-| sleeves mat | ~118 | 2.0% |
-| vakgebied | ~400 (educatief) | 6.7% |
-
-**Bevinding:** `spelmechanisme` is extreem schaars (3.2%) met slechts 4 waarden: Role Playing (79), Roll & Write (76), Flip & Write (34), Roll & Write + Flip & Write (1). Mechanismes als "Worker Placement", "Deck Building", "Area Control" ontbreken volledig.
-
----
-
-## 4. Kritieke Bugs (Blokkerend)
-
-### BUG-001: Corrupte spelerstellingen in puzzelproducten
+### BUG-004: `d&d` query geeft 74 willekeurige resultaten
 - **Ernst:** KRITIEK
-- **Impact:** 11 producten met puzzelstukjes/jaarcijfers als spelerstellingen
-- **Oorzaak:** Scraper parseert getallen uit productnamen foutief
-- **Voorbeeld:** "Puzzle Mat 300 - 6000 Pieces" → min_players=300, max_players=6000
-- **Fix:** Data-opschoning + scraper logica verbeteren voor puzzel/accessoire producten
+- **Locatie:** `lotana_hybrid_search` → `plainto_tsquery('dutch', 'd&d')`
+- **Probleem:** `plainto_tsquery('dutch', 'd&d')` produceert `'d' & 'd'` — matcht ALLES met letter "d" in om het even welk FTS-geindexeerd veld
+- **Impact:** 74 producten matchen, waarvan slechts ~5 echte D&D producten. Alle 74 krijgen nonzero FTS scores die de ranking vervuilen.
+- **Fix:** Pre-processing: `d&d` → `dungeons and dragons`, of `websearch_to_tsquery` gebruiken
 
-### BUG-002: `d&d` query geeft willekeurige resultaten
+### BUG-005: `exact_match` retourneert ander schema dan `hybrid_search`
 - **Ernst:** KRITIEK
-- **Impact:** Gebruikers die "d&d" zoeken krijgen irrelevante producten
-- **Oorzaak:** `plainto_tsquery('dutch', 'd&d')` → `'d' & 'd'` → matcht alles met letter "d"
-- **Fix:** Pre-processing van query: vervang "d&d" → "dungeons and dragons". Of gebruik `websearch_to_tsquery` ipv `plainto_tsquery`
+- **Locatie:** SQL functies `lotana_exact_match` vs `lotana_hybrid_search`
+- **Ontbrekende velden in exact_match:** `availability`, `product_type`, `puzzle_pieces_min`, `puzzle_pieces_max`, `attributes_text`, `fts_score`, `semantic_score`, `combined_score`
+- **Edge Function code:**
+  ```javascript
+  results: exactResults || []  // Retourneert direct zonder field-mapping
+  ```
+- **Impact:** Downstream consumers die `availability` of `product_type` verwachten krijgen `undefined`. Data contract violation.
+- **Fix:** Dezelfde velden toevoegen aan `lotana_exact_match` return type
 
-### BUG-003: Geen spelfouttolerantie in FTS
+### BUG-006: FTS heeft GEEN spelfouttolerantie
 - **Ernst:** KRITIEK (voor UX)
-- **Impact:** "katan", "pandemmie", "tickettoride" geven 0 FTS resultaten
-- **Oorzaak:** `plainto_tsquery` doet geen fuzzy matching
-- **Mitigatie:** Semantic search (embeddings) compenseert dit waarschijnlijk, maar het FTS-component draagt 20-40% bij aan de score
-- **Fix:** Voeg pg_trgm trigram search toe, of gebruik `websearch_to_tsquery` + synoniemen dictionary
+- **Impact:** "katan", "pandemmie", "tickettoride", "exploding kittns" geven allemaal 0 FTS resultaten
+- **Mitigatie:** Semantic search compenseert dit waarschijnlijk (bevestigd: embeddings zijn uitstekend), maar FTS draagt 40-70% bij aan de score (door BUG-001)
+- **Fix:** `pg_trgm` trigram search toevoegen, of synoniemen-dictionary
 
-### BUG-004: 729 producten met `availability = 'unknown'`
+### BUG-007: 729 producten met `availability = 'unknown'` vallen weg bij stock filter
 - **Ernst:** KRITIEK (voor conversie)
-- **Impact:** 12% van het assortiment is onzichtbaar bij `in_stock_only: true`
-- **Oorzaak:** Scraper kan beschikbaarheid niet bepalen voor deze producten
-- **Fix:** Default naar 'in_stock' of behandel 'unknown' als 'in_stock' in de filter logica
+- **Locatie:** `index.ts`, availability filter
+- **Code:**
+  ```javascript
+  results = results.filter((p: any) => p.availability === 'in_stock')
+  ```
+- **Impact:** 12.2% van het assortiment is onzichtbaar bij `in_stock_only: true`
+- **Fix:** `p.availability !== 'out_of_stock'` ipv `p.availability === 'in_stock'`
 
 ---
 
-## 5. Medium Issues
+## 4. HOGE BUGS
 
-### MED-001: Duration filter pakt alleen eerste getal
-- **Impact:** Spellen met bereik-notatie (bv. "60-120 min") worden foutief gefilterd
-- **Ernst:** MEDIUM (1.5x multiplier maskeert deels)
-- **Fix:** Regex aanpassen: pak LAATSTE getal bij bereik, of parse "min-max" patroon
+### BUG-008: Geen `response_format: json_object` op OpenAI API call
+- **Locatie:** `index.ts`, `extractFiltersWithLLM`
+- **Probleem:** Zonder `response_format: { type: "json_object" }` kan GPT-4o-mini markdown-wrapped JSON, tekst voor de JSON, of partial JSON (bij 400 token limiet) retourneren
+- **Regex fix:** `content.replace(/```json\n?|\n?```/g, '')` handelt alleen markdown af
+- **Impact:** Bij onverwachte output faalt `JSON.parse`, fallback naar `getDefaultFilters` die GEEN numerieke filters extraheert
+- **Fix:** `response_format: { type: "json_object" }` toevoegen aan de API call
 
-### MED-002: Language filter laat NULL door
-- **Impact:** 1.846 producten passeren altijd het language filter
-- **Ernst:** MEDIUM
-- **Fix:** Overweeg NULL als "taalonafhankelijk" te labelen, of filter strenger
+### BUG-009: Duration filter pakt alleen eerste getal van bereik
+- **Locatie:** `index.ts`
+- **Code:** `const match = p.playing_time.match(/(\d+)/)`
+- **Probleem:** "60-120 min" → extraheert `60` niet `120`. Met `duration_max: 45` wordt `60 <= 67.5` TRUE, terwijl het spel 120 min kan duren
+- **Impact:** 1.243 producten (33% van die met playing_time) gebruiken bereik-notatie
+- **Fix:** Parse bereik: `const matches = p.playing_time.match(/(\d+)(?:\s*[-–]\s*(\d+))?/)`
 
-### MED-003: "Risk" FTS false positives
-- **Impact:** Zoeken op "Risk" geeft 9 irrelevante resultaten van 13 totaal
-- **Ernst:** MEDIUM (semantic search compenseert)
-- **Oorzaak:** Dutch stemmer matcht "risico" in beschrijvingen
+### BUG-010: `matchesPriceFilter` falsy check op price=0
+- **Locatie:** `index.ts`
+- **Code:** `if (!productPrice) return true`
+- **Probleem:** `!0` is `true` in JavaScript. Product met price=0 bypast alle prijsfilters
+- **Status:** Latente bug (momenteel geen producten met price=0)
+- **Fix:** `if (productPrice === null || productPrice === undefined) return true`
 
-### MED-004: "sleeve" FTS matcht slechts 7 van 118 sleeve-producten
-- **Impact:** Gebruikers die sleeves zoeken vinden ze slecht via FTS
-- **Ernst:** MEDIUM (semantic search compenseert)
-- **Oorzaak:** "sleeve" staat in categorie maar niet altijd in FTS-geindexeerde velden
+### BUG-011: CORS headers missen op 400-response
+- **Locatie:** `index.ts`, query validation
+- **Probleem:** 400-response voor missing/invalid query heeft geen CORS headers. Browser clients kunnen de foutmelding niet lezen. 500-responses hebben WEL CORS.
+- **Fix:** `"Access-Control-Allow-Origin": "*"` toevoegen aan 400-response headers
 
-### MED-005: Ticket to Ride ranking — base game op #16
-- **Impact:** Populairste variant staat niet bovenaan bij FTS
-- **Ernst:** MEDIUM (semantic search kan compenseren)
-- **Fix:** Overweeg populariteits-boost of exacte naam-match bonus
+### BUG-012: Geen HTTP method validatie
+- **Locatie:** `index.ts`, main handler
+- **Probleem:** GET/PUT/DELETE requests vallen door naar `req.json()` dat crasht op bodyless requests → 500 error ipv 405 Method Not Allowed
+- **Fix:** Method check na OPTIONS handler
 
-### MED-006: Spelmechanisme attribute extreem schaars (3.2%)
-- **Impact:** Filtering op mechanisme is onbetrouwbaar
-- **Ernst:** MEDIUM
-- **Fix:** Verrijk data vanuit beschrijvingen of externe bronnen
+### BUG-013: `match_count = -1` crasht de functie
+- **Locatie:** SQL functie `lotana_hybrid_search`
+- **Probleem:** `LIMIT match_count * 2` met negatieve waarde geeft unhandled error "LIMIT must not be negative"
+- **Fix:** `GREATEST(match_count, 0)` gebruiken, of input validatie
 
-### MED-007: 740 producten zonder brand
-- **Impact:** Brand-gebaseerde zoekopdrachten missen 12.3% producten
-- **Ernst:** MEDIUM-LAAG
-- **Fix:** Data-verrijking vanuit scraper of handmatig
+---
+
+## 5. MEDIUM ISSUES
+
+### MED-001: `semantic_weight` heeft geen input validatie
+- Waarden buiten [0,1] produceren nonsensicale resultaten. `-1` geeft `fulltext_weight = 2.0` (FTS 2x gewogen, semantic negatief). `2.0` geeft negatieve FTS bijdrage.
+- **Fix:** `GREATEST(LEAST(semantic_weight, 1.0), 0.0)` in SQL functie
+
+### MED-002: `isEanOrSku` regex is te breed
+- **Code:** `if (/^[A-Z]{2,4}\d{4,10}$/i.test(trimmed)) return true`
+- **Probleem:** "haba1234", "risk12345", "azul5678" worden als SKU behandeld → 0 zoekresultaten, geen fallback naar hybrid search
+- **Fix:** Strictere regex of fallback naar hybrid bij 0 exact results
+
+### MED-003: `getDefaultFilters` fallback extraheert geen numerieke filters
+- Bij LLM-call failure worden `players`, `age`, `duration_max`, `puzzle_pieces`, `language`, `price` allemaal `null`
+- Query "spel voor 4 spelers onder 30 euro" verliest alle filters bij fallback
+- **Fix:** Basis-regex extractie voor getallen in fallback
+
+### MED-004: Language filter laat 1.846 NULL-producten altijd door
+- **Code:** `if (!p.language) return true`
+- **Impact:** 30.8% van producten passeert ALTIJD het language filter
+- **Fix:** Overweeg NULL als "taalonafhankelijk" te labelen
+
+### MED-005: Language filter gebruikt substring match
+- **Code:** `return p.language.toLowerCase().includes(filters.language!.toLowerCase())`
+- **Risico:** "Frans" zou "niet-Franstalig" matchen als die waarde bestond
+- **Fix:** Split op comma, check elk element apart
+
+### MED-006: `in_stock_only` override heeft geen type check
+- `in_stock_only: "true"` (string), `1` (number), `null` worden allemaal geaccepteerd met onverwacht gedrag
+- `null` disablet het stock filter silently
+
+### MED-007: `limit` parameter heeft geen validatie
+- `limit: 10000` retourneert alle 200 hybrid results
+- `limit: -1` retourneert alle results behalve de laatste (`slice(0, -1)`)
+- `limit: 0` retourneert leeg array
+- **Fix:** `Math.max(1, Math.min(limit, 100))`
 
 ### MED-008: Duplicate GIN index op fts kolom
-- **Impact:** Verspilling opslagruimte, tragere writes
-- **Ernst:** LAAG
-- **Fix:** Verwijder `lotana_products_fts_idx` (duplicaat van `idx_lotana_fts`)
+- `idx_lotana_fts` (8.6 MB) en `lotana_products_fts_idx` (8.0 MB) zijn identiek
+- Verspilt 8 MB en vertraagt writes
+- **Fix:** `DROP INDEX lotana_products_fts_idx;`
+
+### MED-009: Ontbrekende indexes op ean_code en sku
+- `lotana_exact_match` doet een Seq Scan op 5.999 rijen (8.8ms nu, schaalt lineair)
+- **Fix:** `CREATE INDEX idx_lotana_ean_code ON lotana_products (ean_code); CREATE INDEX idx_lotana_sku ON lotana_products (sku);`
+
+### MED-010: 86 accessoires met foutieve min_age (geparsed uit productnaam)
+- "Dobbelstenen **18mm**" → min_age=18
+- "**9**-Pocket Portfolio" → min_age=9
+- "A**4** Toploader" → min_age=4
+- "Zip-up Album **18**-pocket" → min_age=18
+- **Fix:** min_age nullen voor product_type = 'accessoire'
+
+### MED-011: 18 groepen duplicate EAN-codes
+- 10 gevallen: beschadigde-doos varianten (zelfde product + "(doos gedeukt)")
+- 5 gevallen: kleur/editie-varianten die EAN delen (IQ Mini Hexpert 4 kleuren, Pokemon decks)
+- 3 gevallen: echte datafouten (verschillende producten, zelfde EAN)
+- **Impact:** `lotana_exact_match` kan meerdere resultaten retourneren voor 1 EAN
+
+### MED-012: Dutch stemmer kan geen samengestelde woorden splitsen
+- "spel" matcht NIET "bordspel", "kaartspel", "familiespel" via FTS
+- `bordspel` → `[bordspel]` (wordt niet gesplitst in `bord` + `spel`)
+- **Impact:** Gebruikers die "spel" zoeken missen veel resultaten
+- **Mitigatie:** Semantic search compenseert dit
+
+### MED-013: Product type trigger misclassificeert 3 games
+- Trigger checkt `name ILIKE '%sleeve%'` en `name ILIKE '%loco%'` VOOR categorie-check
+- Misclassificaties:
+  - "Dobble Classic (Eco Sleeve)" → accessoire (is spel)
+  - "Take Time (+ 26 exclusieve sleeves)" → accessoire (is spel)
+  - "Loco Coco Nuts - Size Matters" → educatief (is spel)
+- **Fix:** Categorie "Gezelschapsspellen" check VOOR naam-checks plaatsen
+
+### MED-014: Spelmechanisme attribute extreem schaars (3.2%)
+- Slechts 190 producten hebben spelmechanisme-data
+- Alleen 4 waarden: Role Playing (79), Roll & Write (76), Flip & Write (34), Roll & Write + Flip & Write (1)
+- Worker Placement, Deck Building, Area Control ontbreken volledig
 
 ---
 
-## 6. Minor / UX Issues
+## 6. MINOR ISSUES
 
 ### MIN-001: `dnd` en `mtg` afkortingen werken niet/slecht
-- FTS voor "dnd" = 0 resultaten (10+ D&D producten bestaan)
-- FTS voor "mtg" = 1 resultaat (Magic: The Gathering producten bestaan)
-- **Fix:** Synoniemen-dictionary of pre-processing
+- `dnd` = 0 resultaten, `mtg` = 1 resultaat
 
-### MIN-002: Geen safeguard voor negatieve/absurde leeftijdswaarden
-- LLM zou normaal geen `age: -5` genereren, maar er is geen server-side validatie
+### MIN-002: Geen timeout op OpenAI API calls
+- Noch `extractFiltersWithLLM` noch `generateEmbedding` heeft een timeout
+- Edge function kan hangen tot Deno timeout (~60s)
 
-### MIN-003: Products without price passeren prijsfilter
-- 3 cadeaubonnen zonder prijs passeren elke prijsfilter (bewust gedrag, maar documenteer)
+### MIN-003: Embedding failure is onherstelbaar
+- Filter extractie heeft fallback naar `getDefaultFilters`, maar embedding failure → 500 error
+- Geen pure FTS fallback beschikbaar
 
-### MIN-004: Geen populariteits-ranking
-- Zoekresultaten zijn puur op tekst- en semantische relevantie
-- "Best verkochte spellen" kan niet beantwoord worden (geen sales data)
+### MIN-004: Age target mode heeft asymmetrisch bereik
+- `case 'target': return productMinAge >= ageFilter.value - 2 && productMinAge <= ageFilter.value + 1`
+- "cadeau voor 8-jarige" → bereik [6, 9]. min_age=10 wordt uitgesloten (kan een "stretch gift" zijn)
 
-### MIN-005: `is_conceptual` flag effect beperkt
-- Enige verschil: semantic_weight 0.80 vs 0.60
-- 20% verschil is relatief klein
+### MIN-005: `matchesPuzzlePieces` falsy check op 0
+- `if (!productMin && !productMax) return true` — `!0` is true, dus puzzle_pieces_min=0 bypast filter
+- Latente bug (0 is geen geldige puzzel-stukaantal)
 
-### MIN-006: Geen support voor "nieuwste releases"
-- Geen `release_date` veld in database
-- `scraped_at`/`created_at` ≠ release datum
+### MIN-006: Empty query matcht ALLE 5.999 rijen in FTS CTE
+- `WHERE search_query = '' OR p.fts @@ ...` — bij lege query full table scan met rank=0
+- Performance issue bij groeiende dataset
 
-### MIN-007: `getDefaultFilters` fallback is beperkt
-- Alleen keyword matching, geen structurele filters
-- Gemist: leeftijd, spelers, duur worden niet geextraheerd in fallback
+### MIN-007: `is_conceptual` conflateert abstracte en categorie-queries
+- "partyspel 18+" → `is_conceptual: true`, maar "partyspel" is een letterlijke `game_type` waarde (82 matches)
+- Categorie-termen zouden juist FTS-gewogen moeten zijn
 
-### MIN-008: HNSW index parameters conservatief
-- `m=16, ef_construction=64` — standaard waarden
-- Bij 6K producten is dit prima, maar overweeg hogere waarden bij groei
+### MIN-008: Non-null assertions op env vars geven onduidelijke errors
+- `Deno.env.get("OPENAI_API_KEY")!` — bij missing env var krijg je pas later een cryptische fout
+- **Fix:** Startup validatie met descriptieve foutmelding
 
-### MIN-009: Geen request rate limiting
-- Edge function heeft geen rate limiting (verify_jwt=true helpt deels)
+### MIN-009: `lotana_exact_match` en `lotana_hybrid_search` zijn VOLATILE maar zouden STABLE kunnen zijn
+- Beide lezen alleen data, wijzigen niets
+- STABLE marking zou PostgreSQL repeated-call optimalisatie mogelijk maken
+
+### MIN-010: Lege query + geen embedding = onbruikbaar
+- Geen input validatie voorkomt een API call met lege query
+
+### MIN-011: 174 games zonder game_type
+- 4.8% van spellen heeft geen type classificatie
+
+### MIN-012: 4 puzzels met comma-gescheiden stukjes-bereik krijgen NULL
+- "2 - 49, 50 - 99" → trigger's CASE statement matcht niet → puzzle_pieces_min/max = NULL
+
+### MIN-013: 2 producten met naam = beschrijving (geen echte beschrijving)
+- ID 2433: "Playmobil the Movie - Marla in het sprookjeskasteel"
+- ID 2648: "Pokemon Playmat - Bulbasaur"
+
+### MIN-014: Scraper is incompleet — slechts 38% opnieuw gescraped
+- 2.284 producten gescraped op 2026-03-08, 3.692 nog van 2026-02-26
+- 10 dagen gap tussen scrape-runs (28 feb → 8 maart)
+
+### MIN-015: Near-duplicate producten crowden zoekresultaten
+- 20 paren met similarity >0.95 (kleurvarianten, MATTE vs PRIME, sequentiele boekjes)
+- Overweeg deduplicatie-logica in zoekresultaten
 
 ---
 
-## 7. Data Quality Issues
+## 7. SEMANTIC SEARCH KWALITEITSRAPPORT
+
+### 7.1 Overzicht
+
+| Test | Resultaat | Cijfer |
+|------|-----------|--------|
+| Gerelateerde producten hoge similarity | Catan familie: 0.77-0.83 | A |
+| Ongerelateerde producten lage similarity | Puzzel vs partyspel: 0.33 | A |
+| Nearest neighbors semantisch correct | 5/5 perfect | A+ |
+| Cross-type contaminatie | Bijna nul in alle tests | A+ |
+| Within-type vs between-type scheiding | Duidelijke gap (0.10-0.15) | A |
+| Near-duplicate detectie | Vindt echte dupes correct | A |
+| Taalbias | Minimaal (delta ~0.03) | A |
+| Beschrijvingslengte bias | Geen gedetecteerd | A |
+
+### 7.2 Similarity Distributies
+
+| Vergelijking | Gem. Similarity |
+|--------------|----------------|
+| Random paren (mediaan) | 0.47 |
+| WITHIN puzzel | 0.593 |
+| WITHIN spel | 0.532 |
+| WITHIN accessoire | 0.514 |
+| spel vs accessoire | 0.454 |
+| spel vs puzzel | 0.407 |
+| puzzel vs accessoire | 0.396 |
+
+### 7.3 Nearest Neighbor Tests
+
+**Catan - basisspel → Top 5:**
+| Buurman | Similarity |
+|---------|-----------|
+| Catan: Het snelle Kaartspel | 0.829 |
+| Catan 6th edition (EN) | 0.816 |
+| Catan Junior | 0.793 |
+| Catan Het Duel | 0.792 |
+| Catan: Steden en Ridders | 0.789 |
+
+PERFECT — alle 10 buren zijn Catan-producten.
+
+**Romantiek in Venetie (puzzel) → Top 5:**
+| Buurman | Similarity |
+|---------|-----------|
+| Zonsondergang in Venetie (1500) | 0.887 |
+| Charms of Venice (4000) | 0.832 |
+| Paris Romance (1500) | 0.779 |
+| Amsterdams kanaal (1500) | 0.774 |
+| Londen, schitterende stad (3000) | 0.768 |
+
+PERFECT — alle 20 buren zijn puzzels met romantische Europese stadsgezichten.
+
+**Card Game Sleeves → Top 5:**
+| Buurman | Similarity |
+|---------|-----------|
+| Standard Sleeves PRIME Value Pack | 0.969 |
+| Standard Sleeves MATTE (50) | 0.918 |
+| Standard Sleeves PRIME (50) | 0.889 |
+| Standard American Sleeves MATTE | 0.865 |
+| Standard European Sleeves MATTE | 0.860 |
+
+PERFECT — alle 10 buren zijn card sleeves. Nul cross-type contaminatie.
+
+### 7.4 Taalbias
+
+| Paar | Similarity |
+|------|-----------|
+| Ticket to Ride NL vs EN | 0.879 |
+| Catan NL vs EN editie | 0.816 |
+| Ticket to Ride NL vs random NL spel | 0.550 |
+
+**Conclusie:** Model prioriteert semantische inhoud boven taal. Minimale taalbias.
+
+### 7.5 Beschrijvingslengte Bias
+
+| Bucket | Gem. Nearest Similarity |
+|--------|------------------------|
+| Medium (141 chars) | 0.829 |
+| Lang (587 chars) | 0.821 |
+
+**Conclusie:** Geen significante lengte-bias.
+
+### 7.6 Near-Duplicates (similarity > 0.95)
+
+20 paren gevonden, allemaal legitieme near-dupes:
+- Mini Loco boekje: Logisch? 1 vs 2 (0.989)
+- Cast Amour MINI zilver vs goud (0.982)
+- Cast Enigma MINI zilver vs zwart (0.980)
+- Dragon Shield Sleeves MATTE varianten (0.973)
+- Catan Sleeves MATTE vs PRIME (0.970)
+
+**Risico:** Zoekresultaten kunnen gecrowded worden door varianten. Overweeg deduplicatie.
+
+---
+
+## 8. FTS TESTS
+
+### 8.1 Exacte productnaam-zoekopdrachten
+
+| Query | FTS Matches | Top resultaat | Status |
+|-------|-------------|---------------|--------|
+| `Catan` | 28 | "Catan - basisspel" (rank 2.8) | PASS |
+| `Ticket to Ride` | 39 | Diverse varianten | WARN — base Europe NL op #16 |
+| `Azul` | 9 | "Azul - De Ramen van Sintra" #1, "Azul (NL)" #3 | WARN |
+| `Monopoly` | 7 | Mix + false positives | WARN |
+| `Risk` | 13 | 9 false positives van 13 | FAIL |
+| `Dixit` | 21 | OK | PASS |
+| `Exploding Kittens` | 16 | OK | PASS |
+| `Pandemic` | 16 | OK | PASS |
+| `Wingspan` | 26 | OK | PASS |
+| `Uno` | 9 | OK | PASS |
+
+### 8.2 Spelfouttolerantie
+
+| Query | Correct | FTS (typo) | FTS (correct) | Status |
+|-------|---------|------------|---------------|--------|
+| `katan` | Catan | **0** | 28 | **FAIL** |
+| `tickettoride` | Ticket to Ride | **0** | 39 | **FAIL** |
+| `azuul` | Azul | **9** (geluk!) | 9 | PASS* |
+| `pandemmie` | Pandemic | **0** | 16 | **FAIL** |
+| `exploding kittns` | Exploding Kittens | **0** | 16 | **FAIL** |
+
+### 8.3 Case Sensitivity
+
+| Query | FTS Matches |
+|-------|-------------|
+| `Catan` / `catan` / `CATAN` | 28 / 28 / 28 |
+
+Case-insensitive. PASS.
+
+### 8.4 Dutch Stemmer Compound Word Test
+
+| Woord | Stemmer output | Splitst? |
+|-------|---------------|----------|
+| `bordspel` | `[bordspel]` | NEE |
+| `gezelschapsspel` | `[gezelschapsspel]` | NEE |
+| `kaartspel` | `[kaartspel]` | NEE |
+| `familiespel` | `[familiespel]` | NEE |
+| `dobbelspel` | `[dobbelspel]` | NEE |
+
+**Conclusie:** PostgreSQL Dutch stemmer splitst GEEN samengestelde woorden. Zoeken op "spel" vindt geen "bordspel".
+
+### 8.5 Synoniemen en Categorietermen
+
+| Query | FTS Matches | Opmerking |
+|-------|-------------|-----------|
+| `bordspel` | 1.644 | Zeer breed |
+| `puzzel` | 1.476 | Breed |
+| `kaartspel` | 1.228 | Breed |
+| `kinderen` | 562 | OK |
+| `cooperatief` | 510 | Goed |
+| `partyspel` | 279 | Goed |
+| `dobbelspel` | 265 | OK |
+| `strategie` | 192 | OK |
+| `gezelschapsspel` | 111 | Laag vs bordspel! |
+| `loco` | 87 | Goed |
+| `familiespel` | 55 | Laag |
+| `sleeve` | 7 | Zeer laag (118 sleeves bestaan) |
+
+### 8.6 Special Characters
+
+| Input | tsquery output | Veilig? |
+|-------|---------------|---------|
+| `!`, `@#$%`, `^&*()` | Lege tsquery | JA |
+| `catan!@#` | `'catan'` | JA — speciale chars gestript |
+| `'; DROP TABLE` | `'drop' & 'tabl'` | JA — geen injection |
+
+---
+
+## 9. EXACT MATCH TESTS
+
+| Test | Input | Resultaat | Status |
+|------|-------|-----------|--------|
+| Echt EAN | `4005556766505` | "Crash Cats Challenge" | PASS |
+| Echt SKU | `THI766505` | Zelfde product | PASS |
+| Fake EAN | `0000000000000` | Leeg | PASS |
+| SQL injection | `'; DROP TABLE--` | Leeg, geen error | PASS |
+| NULL input | `NULL` | Leeg | PASS |
+| Lege string | `""` | Leeg | PASS |
+| Partial EAN | `40055` | Leeg (exact match only) | PASS |
+| Leading zeros | `0778988715567` | "Paw Patrol" puzzel | PASS |
+
+**Maar:** Geen indexes op ean_code/sku → Seq Scan (zie MED-009).
+
+---
+
+## 10. DATA QUALITY ISSUES
 
 | # | Issue | Aantal | Ernst |
 |---|-------|--------|-------|
-| DQ-001 | Corrupte min/max_players (puzzelstukjes als spelers) | 11 | KRITIEK |
-| DQ-002 | min_age = 0 (parseerfout) | 2 | LAAG |
-| DQ-003 | availability = 'unknown' | 729 | HOOG |
-| DQ-004 | Ontbrekend brand | 740 | MEDIUM |
-| DQ-005 | 1 product zonder beschrijving | 1 | LAAG |
+| DQ-001 | Raw HTML in beschrijvingen | 5.450 (90.8%) | KRITIEK |
+| DQ-002 | Corrupte min/max_players (puzzelstukjes als spelers) | 36 | KRITIEK |
+| DQ-003 | Corrupte min_age op accessoires (afmetingen als leeftijd) | 86 | MEDIUM |
+| DQ-004 | availability = 'unknown' | 729 | HOOG |
+| DQ-005 | Duplicate EAN-codes | 18 groepen | MEDIUM |
+| DQ-006 | Ontbrekend brand | 740 | MEDIUM |
+| DQ-007 | Games zonder game_type | 174 | LAAG |
+| DQ-008 | Producten naam = beschrijving | 2 | LAAG |
+| DQ-009 | 1 product zonder beschrijving | 1 | LAAG |
+| DQ-010 | Scraper incompleet (38% opnieuw gescraped) | - | LAAG |
 
 ---
 
-## 8. Aanbevelingen (NIET geimplementeerd)
+## 11. AANBEVELINGEN (geprioriteerd)
 
-### Prioriteit 1 (Kritiek)
+### Prioriteit 1 — KRITIEK (direct fixen)
 
-1. **Fix corrupte spelerstellingen** — Schrijf een migratie-script dat producten met `max_players > 30` AND `product_type IN ('puzzel', 'accessoire')` corrigeert. Pas de scraper aan om spelerstellingen niet te parsen voor non-game producten.
-
-2. **Fix `d&d` query handling** — Voeg pre-processing toe die bekende afkortingen expandeert: `d&d` → `dungeons and dragons`, `dnd` → `dungeons and dragons`, `mtg` → `magic the gathering`.
-
-3. **Verbeter availability data** — Verander `unknown` → `in_stock` (conservatieve aanname) OF pas het stock filter aan: `results.filter(p => p.availability !== 'out_of_stock')` ipv `p.availability === 'in_stock'`.
-
-4. **Voeg fuzzy search toe** — Implementeer `pg_trgm` extensie voor trigram-gebaseerde fuzzy matching als aanvulling op exacte FTS. Dit lost spelfouten als "katan", "pandemmie" op.
-
-### Prioriteit 2 (Medium)
-
-5. **Fix duration parsing** — Parse bereik-notatie correct:
-   ```javascript
-   const matches = p.playing_time.match(/(\d+)(?:\s*[-–]\s*(\d+))?/)
-   const maxDuration = matches[2] ? parseInt(matches[2]) : parseInt(matches[1])
+1. **Fix score normalisatie (BUG-001)** — Dit is de #1 impactvolle fix. Zonder dit is de hele hybrid search effectief kapot.
+   ```sql
+   -- Normaliseer beide scores naar [0,1] bereik
+   WITH fts_stats AS (SELECT MAX(fts_rank) as max_fts FROM fts_results),
+        sem_stats AS (SELECT MAX(semantic_rank) as max_sem FROM semantic_results)
+   SELECT ...,
+     COALESCE(fts.fts_rank / NULLIF(fts_stats.max_fts, 0), 0) * fulltext_weight +
+     COALESCE(sem.semantic_rank / NULLIF(sem_stats.max_sem, 0), 0) * semantic_weight
    ```
 
-6. **Verwijder duplicate GIN index** — `DROP INDEX lotana_products_fts_idx;`
+2. **Strip HTML uit beschrijvingen (DQ-001)** — Verbetert FTS-indexering EN embedding-kwaliteit
+   ```sql
+   UPDATE lotana_products SET description = regexp_replace(description, '<[^>]+>', '', 'g');
+   UPDATE lotana_products SET description = regexp_replace(description, '&amp;', '&', 'g');
+   -- etc. voor andere HTML entities
+   ```
 
-7. **Verrijk spelmechanisme data** — Slechts 3.2% dekking. Gebruik AI om mechanismes te extraheren uit beschrijvingen.
+3. **Fix corrupte spelerstellingen (BUG-003)** — Null players voor non-game producten
+   ```sql
+   UPDATE lotana_products SET min_players = NULL, max_players = NULL
+   WHERE product_type IN ('puzzel', 'accessoire', 'speelgoed') AND min_players IS NOT NULL;
+   ```
 
-8. **Verbeter language filter** — Behandel NULL expliciet, overweeg `language_independent` veld te gebruiken.
+4. **Fix `d&d` query handling (BUG-004)** — Pre-processing in Edge Function
+5. **Fix exact_match schema (BUG-005)** — Voeg ontbrekende velden toe
+6. **Fix availability filter (BUG-007)** — `!== 'out_of_stock'` ipv `=== 'in_stock'`
 
-### Nice-to-have
+### Prioriteit 2 — HOOG
 
-9. **Populariteits-boost** — Voeg een `popularity_score` kolom toe (gebaseerd op views/sales/external ratings) en weeg dit mee in de ranking.
+7. **Voeg `response_format: { type: "json_object" }` toe (BUG-008)**
+8. **Fix duration parsing voor bereiken (BUG-009)**
+9. **Voeg indexes toe op ean_code en sku (MED-009)**
+10. **Verwijder duplicate GIN index (MED-008)**
+11. **Voeg CORS headers toe aan 400-response (BUG-011)**
+12. **Fix isEanOrSku regex of voeg fallback toe (MED-002)**
 
-10. **Synoniemen-dictionary** — Voeg Dutch synoniem-dictionary toe voor FTS (`CREATE TEXT SEARCH DICTIONARY`).
+### Prioriteit 3 — MEDIUM
 
-11. **Exacte naam-match bonus** — Als de query exact overeenkomt met een productnaam, boost die naar #1.
+13. Fix falsy checks (`!price`, `!puzzlePieces`) → expliciete null checks
+14. Voeg input validatie toe voor `semantic_weight`, `match_count`, `limit`
+15. Fix min_age op accessoires (MED-010)
+16. Fix product type trigger volgorde (MED-013)
+17. Voeg HTTP method validatie toe (BUG-012)
+18. Voeg timeout toe op OpenAI calls (MIN-002)
+19. Voeg FTS fallback toe bij embedding failure (MIN-003)
 
-12. **Request caching** — Cache embedding-generatie voor veelvoorkomende queries.
+### Prioriteit 4 — NICE-TO-HAVE
 
-13. **Monitoring/logging** — Voeg structured logging toe voor queries die 0 resultaten geven, zodat je patronen kunt identificeren.
+20. Voeg pg_trgm fuzzy search toe voor spelfouten
+21. Voeg synoniemen-dictionary toe (gezelschapsspel = bordspel)
+22. Voeg deduplicatie-logica toe voor near-duplicate zoekresultaten
+23. Voeg populariteits-boost toe
+24. Verrijk spelmechanisme-data
+25. Verbeter `getDefaultFilters` fallback met basis-regex
 
 ---
 
@@ -599,37 +661,37 @@ De OpenAI API call voor filter extractie heeft:
 | 12-13 jaar | 588 |
 | 14+ jaar | 862 |
 
-### Puzzelstukjes-verdeling
-| Bereik | Aantal |
-|--------|--------|
-| 2-49 | 158 |
-| 50-99 | 23 |
-| 100-499 | 121 |
-| 500-999 | 78 |
-| 1000-1499 | 461 |
-| 1500-1999 | 61 |
-| 2000-2999 | 76 |
-| 3000-4999 | 35 |
-| 5000+ | 11 |
+### Scraping Status
+| Datum | Producten gescraped |
+|-------|---------------------|
+| 2026-03-08 | 2.284 (38%) |
+| 2026-02-28 | 21 |
+| 2026-02-26 | 3.692 (62%) |
 
 ---
 
 ## Bijlage B: Geteste Queries Overzicht
 
-### FTS Queries (40 tests)
-Catan, catan, CATAN, katan, Ticket to Ride, tickettoride, Azul, azuul, Pandemic, pandemmie, Wingspan, Dixit, Exploding Kittens, exploding kittns, bordspel, gezelschapsspel, familiespel, partyspel, kaartspel, cooperatief, cooperatief (met diacritiek), deck building, worker placement, dobbelspel, dnd, mtg, d&d, Monopoly, Risk, Uno, solospel, puzzel 1000, sleeve, loco, dinosaurus, strategie, fantasy, horror, detective, kinderen
+### FTS Queries (40+ tests)
+Catan, catan, CATAN, katan, Ticket to Ride, tickettoride, Azul, azuul, Pandemic, pandemmie, Wingspan, Dixit, Exploding Kittens, exploding kittns, bordspel, gezelschapsspel, familiespel, partyspel, kaartspel, cooperatief, cooperatief (diacritiek), deck building, worker placement, dobbelspel, dnd, mtg, d&d, Monopoly, Risk, Uno, solospel, puzzel 1000, sleeve, loco, dinosaurus, strategie, fantasy, horror, detective, kinderen
 
-### Exact Match Queries (5 tests)
-Echte EAN, echte SKU, fake EAN, SQL injection, lege string
+### Exact Match Queries (8 tests)
+Echte EAN, echte SKU, fake EAN, SQL injection, NULL, lege string, partial EAN, leading zeros
 
-### Data Quality Queries (15 tests)
-Prijzen <1, prijzen >200, min_age=0, min>max players, max_players>30, NULL embeddings, lege descriptions, duplicate URLs, availability unknown, lange descriptions, type+availability matrix, age filter simulatie, player filter simulatie, combined filters, language filter
+### Hybrid Search RPC Tests (12 tests)
+Normaal, lege query, NULL embedding, semantic_weight 0/1/-1/2, match_count 0/-1/999999, lange query, stop words, SQL injection chars
 
-### Code Review (27 checks)
-Duration parsing, language filter, null handling, age safeguards, player filter asymmetrie, hybrid search SQL, LLM prompt analyse, security review, error handling, CORS, request validation, default filters fallback, conceptual flag, semantic weight, product type classification, EAN/SKU detection, embedding generation, response formatting
+### Data Quality Queries (40+ tests)
+Duplicate URLs, duplicate EANs, duplicate namen, HTML in beschrijvingen, korte beschrijvingen, lange namen, naam=beschrijving, prijs-anomalieen, prijs-clusters, categorie-verdeling, cross-veld consistentie, FTS sync, embedding kwaliteit, URL validatie, scraping artefacten, scraping datums
 
-**Totaal: 87 tests**
+### Semantic Search Tests (25+ tests)
+Pairwise similarity (4 paren), nearest neighbors (5 producten x 5-20 buren), outliers, near-duplicates, cross-type contaminatie, taalbias, beschrijvingslengte bias
+
+### SQL Function Tests (15 tests)
+Trigger classificatie-paden, FTS configuratie, stemmer compound words, stop words, special characters, EXPLAIN ANALYZE, index usage, concurrent access, function volatility
+
+**Totaal: ~164 tests**
 
 ---
 
-*Rapport gegenereerd op 2026-03-08 door geautomatiseerde QA-audit.*
+*Rapport gegenereerd op 2026-03-08 door geautomatiseerde QA-audit (4 parallelle test-agents).*
