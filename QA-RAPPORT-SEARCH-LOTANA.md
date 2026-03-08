@@ -89,7 +89,7 @@
 |-------|-------------|---------------|---------------|--------|
 | `Catan` | 28 | "Catan - basisspel" (rank 2.8) | JA, #1 | PASS |
 | `Ticket to Ride` | 39 | Diverse varianten | DEELS — base Europe NL op #16 | WARN |
-| `Azul` | 9 | "Azul Sintra (FR)" | NEE — base Azul niet #1 | WARN |
+| `Azul` | 9 | "Azul - De Ramen van Sintra (NL)" #1, "Azul (NL)" #3 | DEELS — base game op #3 | WARN |
 | `Wingspan` | 26 | (niet getest) | - | - |
 | `Pandemic` | 16 | (niet getest) | - | - |
 | `Dixit` | 21 | (niet getest) | - | - |
@@ -114,6 +114,8 @@
 
 **Conclusie:** FTS (`plainto_tsquery`) heeft **GEEN** spelfouttolerantie. Alle typo's behalve toevallige stem-matches geven 0 FTS resultaten. De semantic search (embeddings) moet dit compenseren — dit werkt waarschijnlijk in de meeste gevallen, maar kan niet via SQL getest worden.
 
+**Extra: `tickettoride` (zonder spaties) = 0 resultaten.** Gebruikers die woorden aan elkaar schrijven krijgen geen FTS match.
+
 #### 3.1.3 Synoniemen en Categorietermen
 
 | Query | FTS Matches | Opmerking |
@@ -137,6 +139,15 @@
 | `detective` | 21 | OK |
 
 **Bevinding:** "sleeve" zoekterm matcht slechts 7 van 118 sleeve-producten. FTS vindt "sleeve" niet in alle product data, waarschijnlijk omdat het woord in de categorie staat maar niet in name/description.
+
+**Extra bevinding:** `gezelschapsspel` (111 matches) vs `bordspel` (1.644 matches) — ondanks dat "gezelschapsspel" het meest gebruikte Nederlandse woord is voor bordspellen, matcht het veel minder producten. Dit komt omdat "bordspel" vaker in game_type/beschrijvingen voorkomt.
+
+**3 Product type misclassificaties gevonden:**
+- "Dobble Classic (Eco Sleeve)" in categorie Gezelschapsspellen → product_type = accessoire
+- "Take Time (+ 26 exclusieve sleeves)" in categorie Gezelschapsspellen → product_type = accessoire
+- "Loco Coco Nuts - Size Matters" in categorie Gezelschapsspellen → product_type = educatief
+
+**Oorzaak:** De trigger `lotana_compute_product_metadata` checkt op "sleeve" en "loco" in naam VOOR het checkt op categorie "gezelschapsspel".
 
 #### 3.1.4 Afkortingen en Speciale Tekens
 
