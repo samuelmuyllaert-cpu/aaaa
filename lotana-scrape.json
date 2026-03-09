@@ -1,0 +1,142 @@
+{
+  "scraped_date": "2026-03-08",
+  "source": "https://www.lotana.be",
+  "company": {
+    "name": "Lotana",
+    "tagline": "Gezelschapsspellen en puzzels. Zo veel keuze, dat is reuze!",
+    "description": "Lotana is a first generation family business, specialized in the online sale of board games and puzzles. Their strengths are the variety of games and puzzles, the fast delivery, and the personal touch.",
+    "owners": ["Tim Schoors", "Marjolijn Van Mellaerts"],
+    "type": "Family business / Online webshop",
+    "specialization": "Board games, puzzles, and toys",
+    "products_in_stock": "5000+",
+    "enterprise_number": "BE 0631.710.124",
+    "bank_account": "BE91 1325 4575 4676"
+  },
+  "contact": {
+    "address": "Bedrijvenpark Parwijskant, Slachterijstraat 3-i, 2260 Westerlo, België",
+    "phone": "+32 14 84 84 64",
+    "phone_local": "014/84.84.64",
+    "email_customer_service": "klantendienst@lotana.be",
+    "email_general": "info@lotana.be",
+    "website": "https://www.lotana.be"
+  },
+  "languages": ["Nederlands", "English", "Français"],
+  "urls": {
+    "homepage_nl": "https://www.lotana.be/nl",
+    "homepage_en": "https://www.lotana.be/en",
+    "homepage_fr": "https://www.lotana.be/fr",
+    "about_us": "https://www.lotana.be/en/about-us",
+    "over_ons": "https://www.lotana.be/nl/over-ons",
+    "brands": "https://www.lotana.be/en/brands",
+    "merken": "https://www.lotana.be/merken",
+    "boardgames": "https://www.lotana.be/en/boardgames",
+    "gezelschapsspellen": "https://www.lotana.be/gezelschapsspellen",
+    "toys": "https://www.lotana.be/en/toys",
+    "customer_service": "https://www.lotana.be/nl/customer-service",
+    "contact": "https://www.lotana.be/nl/contact",
+    "openingsuren": "https://www.lotana.be/nl/openingsuren",
+    "cookies": "https://www.lotana.be/en/cookies"
+  },
+  "product_categories": [
+    "Spellen (Games)",
+    "Puzzels (Puzzles)",
+    "Leuk Leren (Fun Learning)",
+    "Speelgoed (Toys)",
+    "Mini Loco"
+  ],
+  "game_types": [
+    "Bordspellen (Board games)",
+    "Kaartspellen (Card games)",
+    "Reactiespellen (Reaction games)",
+    "Behendigheidsspellen (Dexterity games)",
+    "Dobbelspellen (Dice games)",
+    "Coöperatieve spellen (Cooperative games)",
+    "Denkspellen (Strategy/Thinking games)",
+    "Taalspellen (Language games)",
+    "Rekenspellen (Math games)",
+    "Houten spellen (Wooden games)"
+  ],
+  "toy_categories": [
+    "Construction toys",
+    "Outdoor toys",
+    "Baby toys",
+    "Hand puppets",
+    "Creative items",
+    "Knutselmateriaal (Craft materials)"
+  ],
+  "brands": [
+    "25th Century",
+    "3some Games",
+    "9 Kingdoms Publications",
+    "999 Games",
+    "Abacus Spiele",
+    "Academy Games",
+    "AEG",
+    "Alea",
+    "Amigo",
+    "Ankama",
+    "Aporta Games",
+    "Arcane Tinmen",
+    "Arcane Wonders",
+    "Asmodee",
+    "Blue Orange",
+    "CMON",
+    "Cobble Hill",
+    "Creativ Company",
+    "Czech Games Edition",
+    "Days of Wonder",
+    "DGT",
+    "Eureka",
+    "Fantasy Flight Games",
+    "Gamegenic",
+    "Geronimo Games",
+    "GMT Games",
+    "HABA",
+    "Hasbro",
+    "Heye",
+    "HOT Games",
+    "IELLO",
+    "Jumbo",
+    "Loco",
+    "Ravensburger",
+    "Renegade Game Studios",
+    "Repos Production",
+    "Schmidt",
+    "Selecta Spellen",
+    "SmartGames",
+    "Tactic",
+    "Top1toys",
+    "Uitgeverij Zwijsen",
+    "Ultra Pro",
+    "White Goblin Games",
+    "Z-Man Games",
+    "Zwijsen"
+  ],
+  "shipping": {
+    "carriers": ["Bpost", "PostNL"],
+    "same_day_shipping": "Orders placed on working days before 4 PM are shipped the same day",
+    "ships_from": "Belgium"
+  },
+  "pickup": {
+    "note": "Producten die je wenst af te halen, dienen op voorhand besteld te worden (telefonisch, per mail of via de webshop). Bestellingen kunnen dezelfde dag nog afgehaald worden aan het magazijn.",
+    "location": "Bedrijvenpark Parwijskant, Slachterijstraat 3-i, 2260 Westerlo"
+  },
+  "reviews": {
+    "platform": "Trustpilot",
+    "rating": "5/5 stars",
+    "review_count": 1331,
+    "trustpilot_url": "https://www.trustpilot.com/review/lotana.be"
+  },
+  "featured_products": [
+    {
+      "name": "Bable",
+      "description": "A cooperative language chaos card game",
+      "url": "https://www.lotana.be/en/bable"
+    },
+    {
+      "name": "Wedden dat je het kan?",
+      "description": "Partyspel by Tactic",
+      "url": "https://www.lotana.be/nl/wedden-dat-je-het-kan"
+    }
+  ]
+}
